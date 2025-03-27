@@ -32,7 +32,11 @@ def calc_psf(u, phase, wvl, z, sensor_res, ps):
         mode="constant",
         value=0,
     )
-    sensor_field = AngularSpectrumMethod(wavefront, z = z, wvln = wvl, ps = ps * 1e3, n = 1.0, padding = False)
+
+
+    # use different propagation method
+    # sensor_field = AngularSpectrumMethod(wavefront, z = z, wvln = wvl, ps = ps * 1e3, n = 1.0, padding = False)
+    sensor_field = FresnelDiffraction(wavefront, z = z, wvln = wvl, ps = ps * 1e3, n = 1.0, padding = False)
 
     # Calculate PSF intensity
     psf_inten = sensor_field.abs() ** 2
@@ -73,7 +77,7 @@ def calc_psf(u, phase, wvl, z, sensor_res, ps):
         ]
     # Normalize and convert to float precision
     psf /= psf.sum()  # shape of [ks, ks] or [h, w]
-    psf = diff_float(psf)
+    # psf = diff_float(psf)
 
     return psf
 
@@ -135,24 +139,74 @@ def AngularSpectrumMethod(u, z, wvln=0.489, ps=0.001, n=1.0, padding=True):
     del fx, fy
     return u
 
-class DiffFloat(torch.autograd.Function):
-    """Convert double precision tensor to float precision with gradient calculation.
+
+def FresnelDiffraction(u, z, wvln, ps, n=1.0, padding=True, TF=None):
+    """Fresnel propagation with FFT.
+
+    Ref: Computational fourier optics : a MATLAB tutorial
+         https://github.com/nkotsianas/fourier-propagation/blob/master/FTFP.m
 
     Args:
-        input (tensor): Double precision tensor.
+        u: complex field, shape [H, W] or [B, C, H, W]
+        z (float): propagation distance
+        wvln (float): wavelength in [um]
+        ps (float): pixel size
+        n (float): refractive index
+        padding (bool): padding or not
+        TF (bool): transfer function or impulse response
     """
+    # Padding
+    if padding:
+        try:
+            _, _, Worg, Horg = u.shape
+        except:
+            Horg, Worg = u.shape
+        Wpad, Hpad = Worg // 2, Horg // 2
+        Wimg, Himg = Worg + 2 * Wpad, Horg + 2 * Hpad
+        u = F.pad(u, (Wpad, Wpad, Hpad, Hpad))
+    else:
+        _, _, Wimg, Himg = u.shape
 
-    @staticmethod
-    def forward(ctx, x):
-        ctx.save_for_backward(x)
-        return x.float()
+    # Compute H function
+    assert wvln > 0.1 and wvln < 10, "wvln should be in [um]."
+    wvln_mm = wvln * 1e-3  # [um] to [mm]
+    k = 2 * n * np.pi / wvln_mm
+    x, y = torch.meshgrid(
+        torch.linspace(-0.5 * Wimg * ps, 0.5 * Himg * ps, Wimg + 1, device=u.device)[
+            :-1
+        ],
+        torch.linspace(0.5 * Wimg * ps, -0.5 * Himg * ps, Himg + 1, device=u.device)[
+            :-1
+        ],
+        indexing="xy",
+    )
+    fx, fy = torch.meshgrid(
+        torch.linspace(-0.5 / ps, 0.5 / ps, Wimg + 1, device=u.device)[:-1],
+        torch.linspace(-0.5 / ps, 0.5 / ps, Himg + 1, device=u.device)[:-1],
+        indexing="xy",
+    )
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        (x,) = ctx.saved_tensors
-        grad_input = grad_output.double()
-        return grad_input
+    # TF or IR method
+    # Computational fourier optics. Chapter 5, section 5.1.
+    if TF is None:
+        if ps > wvln_mm * np.abs(z) / (Wimg * ps):
+            TF = True
+        else:
+            TF = False
 
+    if TF:
+        H = np.sqrt(n) * torch.exp(-1j * np.pi * wvln_mm * z * (fx**2 + fy**2) / n)
+        H = fftshift(H)
+    else:    
+        h = n / (1j * wvln_mm * z) * torch.exp(1j * k / (2 * z) * (x**2 + y**2))
+        H = fft2(fftshift(h)) * ps**2
 
-def diff_float(input):
-    return DiffFloat.apply(input)
+    # Fourier transformation
+    # https://pytorch.org/docs/stable/generated/torch.fft.fftshift.html#torch.fft.fftshift
+    u = ifftshift(ifft2(fft2(fftshift(u)) * H))
+
+    # Remove padding
+    if padding:
+        u = u[..., Wpad:-Wpad, Hpad:-Hpad]
+
+    return u
